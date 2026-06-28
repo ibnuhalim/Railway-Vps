@@ -1,9 +1,13 @@
-FROM debian:bookworm-slim
+FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV REGION=ap
 
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
+# Agar RUN pakai bash
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update -y && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    bash \
     openssh-server \
     curl \
     wget \
@@ -27,21 +31,18 @@ RUN wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip
 # Setup SSH
 RUN mkdir -p /run/sshd \
     && ssh-keygen -A \
-    && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/g' /etc/ssh/sshd_config \
-    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/g' /etc/ssh/sshd_config \
     && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config \
     && echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config \
-    && echo "UsePAM yes" >> /etc/ssh/sshd_config
+    && echo "UsePAM yes" >> /etc/ssh/sshd_config \
+    && chsh -s /bin/bash root || true
 
-# Start script
+# Start script pakai bash
 RUN cat > /start.sh <<'EOF'
-#!/bin/sh
-
-clear
+#!/usr/bin/env bash
 
 # Support nama variable lama dan baru
-TOKEN="${ngrokid:-$NGROK_TOKEN}"
-ROOT_PASS="${Password:-$ROOT_PASSWORD}"
+TOKEN="${ngrokid:-${NGROK_TOKEN:-}}"
+ROOT_PASS="${Password:-${ROOT_PASSWORD:-}}"
 NGROK_REGION="${REGION:-ap}"
 
 if [ -z "$ROOT_PASS" ]; then
@@ -51,10 +52,11 @@ fi
 echo "root:${ROOT_PASS}" | chpasswd
 
 echo "==============================================="
-echo " Starting SSH Server + Ngrok"
+echo " Ubuntu 20.04 SSH Server + Ngrok"
 echo " Region   : ${NGROK_REGION}"
 echo " User     : root"
 echo " Password : ${ROOT_PASS}"
+echo " Shell    : bash"
 echo "==============================================="
 
 if [ -z "$TOKEN" ]; then
@@ -71,38 +73,55 @@ else
   ngrok tcp --region "$NGROK_REGION" 22 >/tmp/ngrok.log 2>&1 &
 
   echo "Menunggu URL ngrok..."
-  sleep 8
 
-  echo ""
-  echo "================ NGROK SSH URL ================"
+  for i in {1..15}; do
+    sleep 2
 
-  curl -s http://127.0.0.1:4040/api/tunnels | python3 -c '
+    URL=$(curl -s http://127.0.0.1:4040/api/tunnels | python3 -c '
 import sys, json
 try:
     data = json.load(sys.stdin)
     tunnels = data.get("tunnels", [])
-    if not tunnels:
-        print("Ngrok tunnel belum muncul.")
-        sys.exit(1)
+    if tunnels:
+        print(tunnels[0].get("public_url", ""))
+except:
+    pass
+' 2>/dev/null)
 
-    url = tunnels[0].get("public_url", "")
-    if url.startswith("tcp://"):
-        hostport = url.replace("tcp://", "")
-        host, port = hostport.split(":")
-        print("SSH Command:")
-        print(f"ssh root@{host} -p {port}")
-        print("")
-        print("Raw URL:")
-        print(url)
-    else:
-        print("Public URL:", url)
-except Exception as e:
-    print("Gagal ambil URL ngrok:", e)
-' || echo "Gagal ambil URL ngrok. Cek token atau log /tmp/ngrok.log"
+    if [ -n "$URL" ]; then
+      echo ""
+      echo "================ NGROK SSH URL ================"
 
-  echo ""
-  echo "ROOT Password: ${ROOT_PASS}"
-  echo "==============================================="
+      python3 - <<PY
+url = "$URL"
+
+if url.startswith("tcp://"):
+    hostport = url.replace("tcp://", "")
+    host, port = hostport.split(":")
+    print("SSH Command:")
+    print(f"ssh root@{host} -p {port}")
+    print("")
+    print("Raw URL:")
+    print(url)
+else:
+    print("Public URL:")
+    print(url)
+PY
+
+      echo ""
+      echo "ROOT Password: ${ROOT_PASS}"
+      echo "================================================"
+      break
+    fi
+
+    if [ "$i" -eq 15 ]; then
+      echo ""
+      echo "Gagal ambil URL ngrok."
+      echo "Cek token ngrok atau lihat log:"
+      echo "cat /tmp/ngrok.log"
+      echo ""
+    fi
+  done
 fi
 
 /usr/sbin/sshd -D
@@ -112,4 +131,4 @@ RUN chmod +x /start.sh
 
 EXPOSE 22 80 443 8080 8888 4040
 
-CMD ["/bin/sh", "/start.sh"]
+CMD ["/bin/bash", "/start.sh"]
