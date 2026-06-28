@@ -1,33 +1,115 @@
-FROM debian:stable
+FROM debian:bookworm-slim
 
-ARG ngrokid
-ARG Password
+ENV DEBIAN_FRONTEND=noninteractive
+ENV REGION=ap
 
-ENV Password=${Password}
-ENV ngrokid=${ngrokid}
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    openssh-server \
+    curl \
+    wget \
+    unzip \
+    python3 \
+    passwd \
+    ca-certificates \
+    nano \
+    vim \
+    procps \
+    net-tools \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt update -y > /dev/null 2>&1 && apt upgrade -y > /dev/null 2>&1
-RUN apt install openssh-server wget unzip curl python3 passwd -y > /dev/null 2>&1
+# Install ngrok
+RUN wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip -O /tmp/ngrok.zip \
+    && unzip /tmp/ngrok.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/ngrok \
+    && rm -f /tmp/ngrok.zip
 
-RUN wget -O ngrok.zip https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip > /dev/null 2>&1
-RUN unzip ngrok.zip
-RUN chmod +x ./ngrok
+# Setup SSH
+RUN mkdir -p /run/sshd \
+    && ssh-keygen -A \
+    && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/g' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/g' /etc/ssh/sshd_config \
+    && echo "PermitRootLogin yes" >> /etc/ssh/sshd_config \
+    && echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config \
+    && echo "UsePAM yes" >> /etc/ssh/sshd_config
 
-RUN mkdir -p /run/sshd
-RUN ssh-keygen -A
+# Start script
+RUN cat > /start.sh <<'EOF'
+#!/bin/sh
 
-RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
-RUN echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+clear
 
-RUN echo './ngrok config add-authtoken ${ngrokid} &&' >> /1.sh
-RUN echo './ngrok tcp 22 &>/dev/null &' >> /1.sh
-RUN echo 'sleep 5' >> /1.sh
-RUN echo 'curl -s http://localhost:4040/api/tunnels || true' >> /1.sh
-RUN echo '/usr/sbin/sshd -D' >> /1.sh
+# Support nama variable lama dan baru
+TOKEN="${ngrokid:-$NGROK_TOKEN}"
+ROOT_PASS="${Password:-$ROOT_PASSWORD}"
+NGROK_REGION="${REGION:-ap}"
 
-RUN echo root:${Password}|chpasswd
-RUN chmod 755 /1.sh
+if [ -z "$ROOT_PASS" ]; then
+  ROOT_PASS="craxid"
+fi
 
-EXPOSE 80 8888 8080 443 5130 5131 5132 5133 5134 5135 3306
+echo "root:${ROOT_PASS}" | chpasswd
 
-CMD /1.sh
+echo "==============================================="
+echo " Starting SSH Server + Ngrok"
+echo " Region   : ${NGROK_REGION}"
+echo " User     : root"
+echo " Password : ${ROOT_PASS}"
+echo "==============================================="
+
+if [ -z "$TOKEN" ]; then
+  echo ""
+  echo "ERROR: Token ngrok kosong!"
+  echo "Tambahkan variable di Railway:"
+  echo "ngrokid=TOKEN_NGROK_KAMU"
+  echo "Password=password_kamu"
+  echo "REGION=ap"
+  echo ""
+else
+  ngrok config add-authtoken "$TOKEN" >/dev/null 2>&1
+
+  ngrok tcp --region "$NGROK_REGION" 22 >/tmp/ngrok.log 2>&1 &
+
+  echo "Menunggu URL ngrok..."
+  sleep 8
+
+  echo ""
+  echo "================ NGROK SSH URL ================"
+
+  curl -s http://127.0.0.1:4040/api/tunnels | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    tunnels = data.get("tunnels", [])
+    if not tunnels:
+        print("Ngrok tunnel belum muncul.")
+        sys.exit(1)
+
+    url = tunnels[0].get("public_url", "")
+    if url.startswith("tcp://"):
+        hostport = url.replace("tcp://", "")
+        host, port = hostport.split(":")
+        print("SSH Command:")
+        print(f"ssh root@{host} -p {port}")
+        print("")
+        print("Raw URL:")
+        print(url)
+    else:
+        print("Public URL:", url)
+except Exception as e:
+    print("Gagal ambil URL ngrok:", e)
+' || echo "Gagal ambil URL ngrok. Cek token atau log /tmp/ngrok.log"
+
+  echo ""
+  echo "ROOT Password: ${ROOT_PASS}"
+  echo "==============================================="
+fi
+
+/usr/sbin/sshd -D
+EOF
+
+RUN chmod +x /start.sh
+
+EXPOSE 22 80 443 8080 8888 4040
+
+CMD ["/bin/sh", "/start.sh"]
